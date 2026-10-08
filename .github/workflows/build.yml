@@ -1,0 +1,98 @@
+name: build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kernel:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      KSU_VERSION: "35218"
+      VENDOR_RELEASE: "5.4.302-qgki-g7ed191eb55b6"
+      CLANG_DIR: ${{ github.workspace }}/../toolchains/clang-r563880c
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+
+      - name: Restore toolchains
+        uses: actions/cache@v4
+        with:
+          path: ~/toolchains
+          key: toolchains-clang-r563880c
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.ref }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ github.ref }}-
+            ccache-
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex patch pkg-config git curl tar xz-utils \
+            zip unzip cpio rsync kmod perl python3 libssl-dev libelf-dev pahole \
+            libncurses-dev zlib1g-dev libyaml-dev lz4 zstd device-tree-compiler ccache
+
+      - name: Fetch AOSP clang r563880c
+        run: |
+          if [ ! -x "$HOME/toolchains/clang-r563880c/bin/clang" ]; then
+            mkdir -p "$HOME/toolchains/clang-r563880c"
+            curl -Lf --progress-bar \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android16-qpr2-release/clang-r563880c.tar.gz" \
+              | tar -xz -C "$HOME/toolchains/clang-r563880c"
+          fi
+          "$HOME/toolchains/clang-r563880c/bin/clang" --version | head -1
+
+      - name: Build kernel (witaqua-susfs, BakaSU + SUSFS v2)
+        run: |
+          echo "-g7ed191eb55b6" > .scmversion
+          export PATH="$HOME/toolchains/clang-r563880c/bin:$PATH"
+          export CCACHE_COMPRESS=1
+          export CCACHE_SLOPPINESS="time_macros,include_file_ctime,include_file_mtime,file_stat_matches"
+          export CCACHE_MAXSIZE=20G
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" KSU_VERSION="$KSU_VERSION" \
+            vendor/lahaina-qgki_defconfig vendor/debugfs.config resukisu.config
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 CC="ccache clang" KSU_VERSION="$KSU_VERSION" \
+            -j"$(nproc)" Image
+
+      - name: Show version
+        run: |
+          cat out/include/config/kernel.release || true
+          make -s -C . O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease || true
+
+      - name: Check vermagic (vendor modules must keep loading)
+        run: |
+          release="$(make -s -C . O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 kernelrelease)"
+          echo "kernelrelease: $release"
+          [ "$release" = "$VENDOR_RELEASE" ]
+
+      - name: Upload Image
+        uses: actions/upload-artifact@v4
+        with:
+          name: Image-${{ github.sha }}
+          path: out/arch/arm64/boot/Image
+          if-no-files-found: error
